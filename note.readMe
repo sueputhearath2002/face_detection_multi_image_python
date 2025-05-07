@@ -1,9 +1,0 @@
-============================ Library  need to install============================
-
-pip install opencv-python
-pip install numpy
-pip install tensorflow
-pip install requests
-pip install matplotlib
-pip install ultralytics
-pip install torch --index-url https://download.pytorch.org/whl/cpu
