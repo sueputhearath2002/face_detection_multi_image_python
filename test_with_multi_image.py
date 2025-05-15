@@ -128,7 +128,10 @@ with open("face_detection.tflite", "wb") as f:
 print(" Model converted to 'face_detection.tflite'")
 
 # === YOLOv8 FACE DETECTION ===
+# === YOLOv8 FACE DETECTION ===
 yolo_model_path = "yolov8n-face.pt"
+
+# Download YOLO model if not exists
 if not os.path.exists(yolo_model_path):
     print("Downloading YOLOv8 face model...")
     url = "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
@@ -136,57 +139,132 @@ if not os.path.exists(yolo_model_path):
     with open(yolo_model_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
-    print(" YOLOv8 model downloaded!")
+    print("✅ YOLOv8 model downloaded!")
 
 def detect_and_classify_faces(image_path, model, class_names):
+    """Detect and classify faces in an image."""
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image '{image_path}' not found.")
 
+    # Load YOLO model and image
     model_yolo = YOLO(yolo_model_path)
     image = cv2.imread(image_path)
     results = model_yolo(image)
 
-    face_boxes = []
+    height, width, _ = image.shape
+    detected_faces = {}
+
+    # Process each detected face
     for result in results:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            face_boxes.append((x1, y1, x2, y2))
+            
+            # Add padding and make it square
+            w = x2 - x1
+            h = y2 - y1
+            size = max(w, h)
+            cx = x1 + w // 2
+            cy = y1 + h // 2
 
-    detected_faces = {}
+            # Ensure square crop stays within bounds
+            half_size = size // 2
+            sx1 = max(0, cx - half_size)
+            sy1 = max(0, cy - half_size)
+            sx2 = min(width, cx + half_size)
+            sy2 = min(height, cy + half_size)
 
-    for (fx1, fy1, fx2, fy2) in face_boxes:
-        face = image[fy1:fy2, fx1:fx2]
-        if face.shape[0] == 0 or face.shape[1] == 0:
-            continue
+            face = image[sy1:sy2, sx1:sx2]
 
-        face_resized = cv2.resize(face, (224, 224))
-        face_preprocessed = preprocess_input(face_resized.astype(np.float32))
-        face_array = np.expand_dims(face_preprocessed, axis=0)
+            # Skip if crop failed
+            if face.shape[0] == 0 or face.shape[1] == 0:
+                continue
 
-        predictions = model.predict(face_array)[0]
-        best_index = np.argmax(predictions)
-        best_class = class_names[best_index]
-        best_confidence = float(predictions[best_index])
+            # Resize & preprocess
+            face_resized = cv2.resize(face, (224, 224))
+            face_preprocessed = preprocess_input(face_resized.astype(np.float32))
+            face_input = np.expand_dims(face_preprocessed, axis=0)
 
-        if best_class not in detected_faces or best_confidence > detected_faces[best_class]:
-            detected_faces[best_class] = best_confidence
+            # Predict
+            predictions = model.predict(face_input, verbose=0)[0]
+            best_index = np.argmax(predictions)
+            best_class = class_names[best_index]
+            best_confidence = float(predictions[best_index])
 
-        label_text = f"{best_class}: {best_confidence:.2f}"
-        cv2.rectangle(image, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
-        cv2.putText(image, label_text, (fx1, fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Avoid duplicates or keep the highest confidence
+            if best_class not in detected_faces or best_confidence > detected_faces[best_class]:
+                detected_faces[best_class] = best_confidence
 
+            # Draw results
+            label_text = f"{best_class}: {best_confidence:.2f}"
+            cv2.rectangle(image, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
+            cv2.putText(image, label_text, (sx1, sy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Save and display results
     output_path = "detected_faces.png"
     cv2.imwrite(output_path, image)
     cv2.imshow("Detected Faces", image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    # ✅ Format: [{"name": "confidence"}, ...]
-    formatted_faces = [{k: f"{v}"} for k, v in detected_faces.items()]
+    # Format and print results
+    formatted_faces = [{k: f"{v:.2f}"} for k, v in detected_faces.items()]
     print("Detected faces:", formatted_faces)
+    
+    return detected_faces
+
+# Test the function with a specific image
+test_image_path = "test_folder/people_v5.png"
+results = detect_and_classify_faces(test_image_path, model, class_names)
+
+# def detect_and_classify_faces(image_path, model, class_names):
+#     if not os.path.exists(image_path):
+#         raise FileNotFoundError(f"Image '{image_path}' not found.")
+
+#     model_yolo = YOLO(yolo_model_path)
+#     image = cv2.imread(image_path)
+#     results = model_yolo(image)
+
+#     face_boxes = []
+#     for result in results:
+#         for box in result.boxes:
+#             x1, y1, x2, y2 = map(int, box.xyxy[0])
+#             face_boxes.append((x1, y1, x2, y2))
+
+#     detected_faces = {}
+
+#     for (fx1, fy1, fx2, fy2) in face_boxes:
+#         face = image[fy1:fy2, fx1:fx2]
+#         if face.shape[0] == 0 or face.shape[1] == 0:
+#             continue
+
+#         face_resized = cv2.resize(face, (224, 224))
+#         face_preprocessed = preprocess_input(face_resized.astype(np.float32))
+#         face_array = np.expand_dims(face_preprocessed, axis=0)
+
+#         predictions = model.predict(face_array)[0]
+#         best_index = np.argmax(predictions)
+#         best_class = class_names[best_index]
+#         best_confidence = float(predictions[best_index])
+
+#         if best_class not in detected_faces or best_confidence > detected_faces[best_class]:
+#             detected_faces[best_class] = best_confidence
+
+#         label_text = f"{best_class}: {best_confidence:.2f}"
+#         cv2.rectangle(image, (fx1, fy1), (fx2, fy2), (0, 255, 0), 2)
+#         cv2.putText(image, label_text, (fx1, fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+#     output_path = "detected_faces.png"
+#     cv2.imwrite(output_path, image)
+#     cv2.imshow("Detected Faces", image)
+#     cv2.waitKey(0)
+#     cv2.destroyAllWindows()
+
+#     # ✅ Format: [{"name": "confidence"}, ...]
+#     formatted_faces = [{k: f"{v}"} for k, v in detected_faces.items()]
+#     print("Detected faces:", formatted_faces)
 
 # === TEST FUNCTION ===
-detect_and_classify_faces("test_folder/people_v4.png", model, class_names)
+# detect_and_classify_faces("test_folder/people_v5.png", model, class_names)
 
 # =============================103%===================
 
