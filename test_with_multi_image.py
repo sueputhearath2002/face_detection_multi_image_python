@@ -1,6 +1,5 @@
-
-import cv2
 import os
+import cv2
 import numpy as np
 import tensorflow as tf
 import requests
@@ -10,19 +9,23 @@ from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
 from ultralytics import YOLO
 
 # === CONFIGURATION ===
-dataset_dir = "datasv4"
+dataset_dir = "dataset_v1"
 input_shape = (224, 224, 3)
 batch_size = 32
 epochs = 50
 validation_split = 0.2
 seed = 123
+yolo_model_path = "yolov8n.pt"  # Changed to general YOLOv8 model
+face_output_dir = "cropped_faces"
+
+# === PREPARE FACE OUTPUT DIR ===
+os.makedirs(face_output_dir, exist_ok=True)
 
 # === CHECK DATASET DIRECTORY ===
 if not os.path.exists(dataset_dir):
     raise FileNotFoundError(f"Dataset directory '{dataset_dir}' not found!")
-
-print(f" Dataset directory '{dataset_dir}' found.")
-print(f" Contents: {os.listdir(dataset_dir)}")
+print(f"✅ Dataset directory '{dataset_dir}' found.")
+print(f"📁 Contents: {os.listdir(dataset_dir)}")
 
 # === DATA LOADING & AUGMENTATION ===
 train_datagen = ImageDataGenerator(
@@ -56,13 +59,12 @@ val_ds = train_datagen.flow_from_directory(
     seed=seed
 )
 
-# === PRINT CLASS LABELS ===
+# === CLASS LABELS ===
 class_names = list(train_ds.class_indices.keys())
-print(" Class Names:", class_names)
-
+print("🏷️ Class Names:", class_names)
 with open("labels.txt", "w") as f:
-    f.writelines("\n".join(class_names))
-print("'labels.txt' created!")
+    f.write("\n".join(class_names))
+print("✅ 'labels.txt' created!")
 
 # === MODEL ARCHITECTURE ===
 base_model = tf.keras.applications.MobileNetV3Large(
@@ -82,23 +84,21 @@ model = tf.keras.Sequential([
     tf.keras.layers.Dense(len(class_names), activation="softmax")
 ])
 
-# === COMPILE MODEL ===
-lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(0.001, 1000, 0.9)
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+    optimizer=tf.keras.optimizers.Adam(learning_rate=tf.keras.optimizers.schedules.ExponentialDecay(0.001, 1000, 0.9)),
     loss="categorical_crossentropy",
     metrics=["accuracy"]
 )
 model.summary()
 
-# === TRAIN THE MODEL (Initial Phase) ===
-print("Training classifier layers...")
+# === TRAIN ===
+print("📈 Training model...")
 history = model.fit(train_ds, validation_data=val_ds, epochs=epochs)
 
-# === OPTIONAL: UNFREEZE AND FINE-TUNE ===
+# === FINE-TUNING ===
 print("🔓 Fine-tuning base model...")
 base_model.trainable = True
-for layer in base_model.layers[:100]:  # Freeze early layers
+for layer in base_model.layers[:100]:
     layer.trainable = False
 
 model.compile(
@@ -109,10 +109,9 @@ model.compile(
 
 fine_tune_epochs = 10
 total_epochs = epochs + fine_tune_epochs
-
 history_fine = model.fit(train_ds, validation_data=val_ds, epochs=total_epochs, initial_epoch=history.epoch[-1] + 1)
 
-# === PLOT TRAINING ACCURACY ===
+# === PLOT ACCURACY ===
 plt.plot(history.history["accuracy"] + history_fine.history["accuracy"], label="Train Accuracy")
 plt.plot(history.history["val_accuracy"] + history_fine.history["val_accuracy"], label="Validation Accuracy")
 plt.xlabel("Epochs")
@@ -125,97 +124,483 @@ converter = tf.lite.TFLiteConverter.from_keras_model(model)
 tflite_model = converter.convert()
 with open("face_detection.tflite", "wb") as f:
     f.write(tflite_model)
-print(" Model converted to 'face_detection.tflite'")
+print("✅ Model converted to 'face_detection.tflite'")
 
-# === YOLOv8 FACE DETECTION ===
-# === YOLOv8 FACE DETECTION ===
-yolo_model_path = "yolov8n-face.pt"
-
-# Download YOLO model if not exists
+# === DOWNLOAD YOLOv8n MODEL IF NEEDED ===
 if not os.path.exists(yolo_model_path):
-    print("Downloading YOLOv8 face model...")
-    url = "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
-    response = requests.get(url, stream=True)
-    with open(yolo_model_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print("✅ YOLOv8 model downloaded!")
+    print("⬇️ Downloading YOLOv8 model...")
+    try:
+        url = "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        with open(yolo_model_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("✅ YOLOv8 model downloaded!")
+    except requests.exceptions.HTTPError as e:
+        print("❌ Failed to download YOLOv8 model. Please download it manually and place it at:", yolo_model_path)
+        raise e
 
+# === DETECT + CLASSIFY FUNCTION ===
 def detect_and_classify_faces(image_path, model, class_names):
-    """Detect and classify faces in an image."""
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image '{image_path}' not found.")
 
-    # Load YOLO model and image
     model_yolo = YOLO(yolo_model_path)
     image = cv2.imread(image_path)
     results = model_yolo(image)
-
     height, width, _ = image.shape
     detected_faces = {}
+    face_id = 0
 
-    # Process each detected face
     for result in results:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            
-            # Add padding and make it square
-            w = x2 - x1
-            h = y2 - y1
+            w, h = x2 - x1, y2 - y1
             size = max(w, h)
-            cx = x1 + w // 2
-            cy = y1 + h // 2
-
-            # Ensure square crop stays within bounds
-            half_size = size // 2
-            sx1 = max(0, cx - half_size)
-            sy1 = max(0, cy - half_size)
-            sx2 = min(width, cx + half_size)
-            sy2 = min(height, cy + half_size)
-
+            cx, cy = x1 + w // 2, y1 + h // 2
+            half = size // 2
+            sx1, sy1 = max(0, cx - half), max(0, cy - half)
+            sx2, sy2 = min(width, cx + half), min(height, cy + half)
             face = image[sy1:sy2, sx1:sx2]
 
-            # Skip if crop failed
             if face.shape[0] == 0 or face.shape[1] == 0:
                 continue
 
-            # Resize & preprocess
             face_resized = cv2.resize(face, (224, 224))
             face_preprocessed = preprocess_input(face_resized.astype(np.float32))
             face_input = np.expand_dims(face_preprocessed, axis=0)
 
-            # Predict
             predictions = model.predict(face_input, verbose=0)[0]
             best_index = np.argmax(predictions)
             best_class = class_names[best_index]
-            best_confidence = float(predictions[best_index])
+            confidence = float(predictions[best_index])
 
-            # Avoid duplicates or keep the highest confidence
-            if best_class not in detected_faces or best_confidence > detected_faces[best_class]:
-                detected_faces[best_class] = best_confidence
+            if best_class not in detected_faces or confidence > detected_faces[best_class]:
+                detected_faces[best_class] = confidence
 
-            # Draw results
-            label_text = f"{best_class}: {best_confidence:.2f}"
-            cv2.rectangle(image, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
-            cv2.putText(image, label_text, (sx1, sy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                face_filename = f"{face_output_dir}/{best_class}_{face_id}_{confidence:.2f}.png"
+                cv2.imwrite(face_filename, face_resized)
+                print(f"✅ Saved face: {face_filename}")
+                face_id += 1
 
-    # Save and display results
-    output_path = "detected_faces.png"
-    cv2.imwrite(output_path, image)
-    cv2.imshow("Detected Faces", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    # Format and print results
-    formatted_faces = [{k: f"{v:.2f}"} for k, v in detected_faces.items()]
-    print("Detected faces:", formatted_faces)
-    
+    print("🧠 Detected classes:", [{k: f"{v:.2f}"} for k, v in detected_faces.items()])
     return detected_faces
 
-# Test the function with a specific image
-test_image_path = "test_folder/people_v5.png"
+# === TEST FUNCTION ===
+test_image_path = "test_folder/brad_pitt  and girl.png"
 results = detect_and_classify_faces(test_image_path, model, class_names)
 
+# ========================================v3
+# import os
+# import cv2
+# import numpy as np
+# import tensorflow as tf
+# import requests
+# import matplotlib.pyplot as plt
+# from tensorflow.keras.preprocessing.image import ImageDataGenerator
+# from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
+# from ultralytics import YOLO
+
+# # === CONFIGURATION ===
+# dataset_dir = "dataset_v1"
+# input_shape = (224, 224, 3)
+# batch_size = 32
+# epochs = 50
+# validation_split = 0.2
+# seed = 123
+# yolo_model_path = "yolov8n-face.pt"
+# face_output_dir = "cropped_faces"
+
+# # === PREPARE FACE OUTPUT DIR ===
+# os.makedirs(face_output_dir, exist_ok=True)
+
+# # === CHECK DATASET DIRECTORY ===
+# if not os.path.exists(dataset_dir):
+#     raise FileNotFoundError(f"Dataset directory '{dataset_dir}' not found!")
+# print(f" Dataset directory '{dataset_dir}' found.")
+# print(f" Contents: {os.listdir(dataset_dir)}")
+
+# # === DATA LOADING & AUGMENTATION ===
+# train_datagen = ImageDataGenerator(
+#     preprocessing_function=preprocess_input,
+#     rotation_range=40,
+#     width_shift_range=0.3,
+#     height_shift_range=0.3,
+#     shear_range=0.3,
+#     zoom_range=0.4,
+#     brightness_range=[0.6, 1.4],
+#     horizontal_flip=True,
+#     fill_mode="nearest",
+#     validation_split=validation_split
+# )
+
+# train_ds = train_datagen.flow_from_directory(
+#     dataset_dir,
+#     target_size=input_shape[:2],
+#     batch_size=batch_size,
+#     class_mode="categorical",
+#     subset="training",
+#     seed=seed
+# )
+
+# val_ds = train_datagen.flow_from_directory(
+#     dataset_dir,
+#     target_size=input_shape[:2],
+#     batch_size=batch_size,
+#     class_mode="categorical",
+#     subset="validation",
+#     seed=seed
+# )
+
+# # === PRINT CLASS LABELS ===
+# class_names = list(train_ds.class_indices.keys())
+# print(" Class Names:", class_names)
+# with open("labels.txt", "w") as f:
+#     f.write("\n".join(class_names))
+# print(" 'labels.txt' created!")
+
+# # === MODEL ARCHITECTURE ===
+# base_model = tf.keras.applications.MobileNetV3Large(
+#     input_shape=input_shape,
+#     include_top=False,
+#     weights="imagenet",
+#     include_preprocessing=True
+# )
+# base_model.trainable = False
+
+# model = tf.keras.Sequential([
+#     base_model,
+#     tf.keras.layers.GlobalAveragePooling2D(),
+#     tf.keras.layers.Dense(512, activation="relu"),
+#     tf.keras.layers.BatchNormalization(),
+#     tf.keras.layers.Dropout(0.6),
+#     tf.keras.layers.Dense(len(class_names), activation="softmax")
+# ])
+
+# # === COMPILE MODEL ===
+# lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(0.001, 1000, 0.9)
+# model.compile(
+#     optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+#     loss="categorical_crossentropy",
+#     metrics=["accuracy"]
+# )
+# model.summary()
+
+# # === TRAIN THE MODEL ===
+# print("Training classifier layers...")
+# history = model.fit(train_ds, validation_data=val_ds, epochs=epochs)
+
+# # === OPTIONAL: FINE-TUNE ===
+# print("🔓 Fine-tuning base model...")
+# base_model.trainable = True
+# for layer in base_model.layers[:100]:
+#     layer.trainable = False
+
+# model.compile(
+#     optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+#     loss="categorical_crossentropy",
+#     metrics=["accuracy"]
+# )
+
+# fine_tune_epochs = 10
+# total_epochs = epochs + fine_tune_epochs
+# history_fine = model.fit(train_ds, validation_data=val_ds, epochs=total_epochs, initial_epoch=history.epoch[-1] + 1)
+
+# # === PLOT ACCURACY ===
+# plt.plot(history.history["accuracy"] + history_fine.history["accuracy"], label="Train Accuracy")
+# plt.plot(history.history["val_accuracy"] + history_fine.history["val_accuracy"], label="Validation Accuracy")
+# plt.xlabel("Epochs")
+# plt.ylabel("Accuracy")
+# plt.legend()
+# plt.show()
+
+# # === CONVERT TO TFLITE ===
+# converter = tf.lite.TFLiteConverter.from_keras_model(model)
+# tflite_model = converter.convert()
+# with open("face_detection.tflite", "wb") as f:
+#     f.write(tflite_model)
+# print(" Model converted to 'face_detection.tflite'")
+
+# # === DOWNLOAD YOLOv8 FACE MODEL ===
+# if not os.path.exists(yolo_model_path):
+#     print("Downloading YOLOv8 face model...")
+#     url = "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
+#     response = requests.get(url, stream=True)
+#     with open(yolo_model_path, "wb") as f:
+#         for chunk in response.iter_content(chunk_size=8192):
+#             f.write(chunk)
+#     print("✅ YOLOv8 model downloaded!")
+
+# # === FACE DETECTION + CLASSIFICATION FUNCTION ===
+# def detect_and_classify_faces(image_path, model, class_names):
+#     if not os.path.exists(image_path):
+#         raise FileNotFoundError(f"Image '{image_path}' not found.")
+
+#     model_yolo = YOLO(yolo_model_path)
+#     image = cv2.imread(image_path)
+#     results = model_yolo(image)
+#     height, width, _ = image.shape
+#     detected_faces = {}
+#     face_id = 0
+
+#     for result in results:
+#         for box in result.boxes:
+#             x1, y1, x2, y2 = map(int, box.xyxy[0])
+#             w, h = x2 - x1, y2 - y1
+#             size = max(w, h)
+#             cx, cy = x1 + w // 2, y1 + h // 2
+#             half = size // 2
+#             sx1, sy1 = max(0, cx - half), max(0, cy - half)
+#             sx2, sy2 = min(width, cx + half), min(height, cy + half)
+#             face = image[sy1:sy2, sx1:sx2]
+
+#             if face.shape[0] == 0 or face.shape[1] == 0:
+#                 continue
+
+#             face_resized = cv2.resize(face, (224, 224))
+#             face_preprocessed = preprocess_input(face_resized.astype(np.float32))
+#             face_input = np.expand_dims(face_preprocessed, axis=0)
+
+#             predictions = model.predict(face_input, verbose=0)[0]
+#             best_index = np.argmax(predictions)
+#             best_class = class_names[best_index]
+#             confidence = float(predictions[best_index])
+
+#             if best_class not in detected_faces or confidence > detected_faces[best_class]:
+#                 detected_faces[best_class] = confidence
+
+#                 face_filename = f"{face_output_dir}/{best_class}_{face_id}_{confidence:.2f}.png"
+#                 cv2.imwrite(face_filename, face_resized)
+#                 print(f"✅ Saved face: {face_filename}")
+#                 face_id += 1
+
+#     print("Detected faces:", [{k: f"{v:.2f}"} for k, v in detected_faces.items()])
+#     return detected_faces
+
+# # === RUN TEST ===
+# test_image_path = "test_folder/people_v3.png"
+# results = detect_and_classify_faces(test_image_path, model, class_names)
+
+
+# ==============================correct 100% full
+# import cv2
+# import os
+# import numpy as np
+# import tensorflow as tf
+# import requests
+# import matplotlib.pyplot as plt
+# from tensorflow.keras.preprocessing.image import ImageDataGenerator
+# from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
+# from ultralytics import YOLO
+
+# # === CONFIGURATION ===
+# dataset_dir = "dataset_v1"
+# input_shape = (224, 224, 3)
+# batch_size = 32
+# epochs = 50
+# validation_split = 0.2
+# seed = 123
+
+# # === CHECK DATASET DIRECTORY ===
+# if not os.path.exists(dataset_dir):
+#     raise FileNotFoundError(f"Dataset directory '{dataset_dir}' not found!")
+
+# print(f" Dataset directory '{dataset_dir}' found.")
+# print(f" Contents: {os.listdir(dataset_dir)}")
+
+# # === DATA LOADING & AUGMENTATION ===
+# train_datagen = ImageDataGenerator(
+#     preprocessing_function=preprocess_input,
+#     rotation_range=40,
+#     width_shift_range=0.3,
+#     height_shift_range=0.3,
+#     shear_range=0.3,
+#     zoom_range=0.4,
+#     brightness_range=[0.6, 1.4],
+#     horizontal_flip=True,
+#     fill_mode="nearest",
+#     validation_split=validation_split
+# )
+
+# train_ds = train_datagen.flow_from_directory(
+#     dataset_dir,
+#     target_size=input_shape[:2],
+#     batch_size=batch_size,
+#     class_mode="categorical",
+#     subset="training",
+#     seed=seed
+# )
+
+# val_ds = train_datagen.flow_from_directory(
+#     dataset_dir,
+#     target_size=input_shape[:2],
+#     batch_size=batch_size,
+#     class_mode="categorical",
+#     subset="validation",
+#     seed=seed
+# )
+
+# # === PRINT CLASS LABELS ===
+# class_names = list(train_ds.class_indices.keys())
+# print(" Class Names:", class_names)
+
+# with open("labels.txt", "w") as f:
+#     f.writelines("\n".join(class_names))
+# print("'labels.txt' created!")
+
+# # === MODEL ARCHITECTURE ===
+# base_model = tf.keras.applications.MobileNetV3Large(
+#     input_shape=input_shape,
+#     include_top=False,
+#     weights="imagenet",
+#     include_preprocessing=True
+# )
+# base_model.trainable = False
+
+# model = tf.keras.Sequential([
+#     base_model,
+#     tf.keras.layers.GlobalAveragePooling2D(),
+#     tf.keras.layers.Dense(512, activation="relu"),
+#     tf.keras.layers.BatchNormalization(),
+#     tf.keras.layers.Dropout(0.6),
+#     tf.keras.layers.Dense(len(class_names), activation="softmax")
+# ])
+
+# # === COMPILE MODEL ===
+# lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(0.001, 1000, 0.9)
+# model.compile(
+#     optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+#     loss="categorical_crossentropy",
+#     metrics=["accuracy"]
+# )
+# model.summary()
+
+# # === TRAIN THE MODEL (Initial Phase) ===
+# print("Training classifier layers...")
+# history = model.fit(train_ds, validation_data=val_ds, epochs=epochs)
+
+# # === OPTIONAL: UNFREEZE AND FINE-TUNE ===
+# print("🔓 Fine-tuning base model...")
+# base_model.trainable = True
+# for layer in base_model.layers[:100]:  # Freeze early layers
+#     layer.trainable = False
+
+# model.compile(
+#     optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+#     loss="categorical_crossentropy",
+#     metrics=["accuracy"]
+# )
+
+# fine_tune_epochs = 10
+# total_epochs = epochs + fine_tune_epochs
+
+# history_fine = model.fit(train_ds, validation_data=val_ds, epochs=total_epochs, initial_epoch=history.epoch[-1] + 1)
+
+# # === PLOT TRAINING ACCURACY ===
+# plt.plot(history.history["accuracy"] + history_fine.history["accuracy"], label="Train Accuracy")
+# plt.plot(history.history["val_accuracy"] + history_fine.history["val_accuracy"], label="Validation Accuracy")
+# plt.xlabel("Epochs")
+# plt.ylabel("Accuracy")
+# plt.legend()
+# plt.show()
+
+# # === CONVERT TO TFLITE ===
+# converter = tf.lite.TFLiteConverter.from_keras_model(model)
+# tflite_model = converter.convert()
+# with open("face_detection.tflite", "wb") as f:
+#     f.write(tflite_model)
+# print(" Model converted to 'face_detection.tflite'")
+
+# # === YOLOv8 FACE DETECTION ===
+# # === YOLOv8 FACE DETECTION ===
+# yolo_model_path = "yolov8n-face.pt"
+
+# # Download YOLO model if not exists
+# if not os.path.exists(yolo_model_path):
+#     print("Downloading YOLOv8 face model...")
+#     url = "https://github.com/ultralytics/assets/releases/download/v8.1.0/yolov8n.pt"
+#     response = requests.get(url, stream=True)
+#     with open(yolo_model_path, "wb") as f:
+#         for chunk in response.iter_content(chunk_size=8192):
+#             f.write(chunk)
+#     print("✅ YOLOv8 model downloaded!")
+
+# def detect_and_classify_faces(image_path, model, class_names):
+#     """Detect and classify faces in an image."""
+#     if not os.path.exists(image_path):
+#         raise FileNotFoundError(f"Image '{image_path}' not found.")
+
+#     # Load YOLO model and image
+#     model_yolo = YOLO(yolo_model_path)
+#     image = cv2.imread(image_path)
+#     results = model_yolo(image)
+
+#     height, width, _ = image.shape
+#     detected_faces = {}
+
+#     # Process each detected face
+#     for result in results:
+#         for box in result.boxes:
+#             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            
+#             # Add padding and make it square
+#             w = x2 - x1
+#             h = y2 - y1
+#             size = max(w, h)
+#             cx = x1 + w // 2
+#             cy = y1 + h // 2
+
+#             # Ensure square crop stays within bounds
+#             half_size = size // 2
+#             sx1 = max(0, cx - half_size)
+#             sy1 = max(0, cy - half_size)
+#             sx2 = min(width, cx + half_size)
+#             sy2 = min(height, cy + half_size)
+
+#             face = image[sy1:sy2, sx1:sx2]
+
+#             # Skip if crop failed
+#             if face.shape[0] == 0 or face.shape[1] == 0:
+#                 continue
+
+#             # Resize & preprocess
+#             face_resized = cv2.resize(face, (224, 224))
+#             face_preprocessed = preprocess_input(face_resized.astype(np.float32))
+#             face_input = np.expand_dims(face_preprocessed, axis=0)
+
+#             # Predict
+#             predictions = model.predict(face_input, verbose=0)[0]
+#             best_index = np.argmax(predictions)
+#             best_class = class_names[best_index]
+#             best_confidence = float(predictions[best_index])
+
+#             # Avoid duplicates or keep the highest confidence
+#             if best_class not in detected_faces or best_confidence > detected_faces[best_class]:
+#                 detected_faces[best_class] = best_confidence
+
+#             # Draw results
+#             label_text = f"{best_class}: {best_confidence:.2f}"
+#             cv2.rectangle(image, (sx1, sy1), (sx2, sy2), (0, 255, 0), 2)
+#             cv2.putText(image, label_text, (sx1, sy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+#     # Save and display results
+#     output_path = "detected_faces.png"
+#     cv2.imwrite(output_path, image)
+#     cv2.imshow("Detected Faces", image)
+#     cv2.waitKey(0)
+#     cv2.destroyAllWindows()
+
+#     # Format and print results
+#     formatted_faces = [{k: f"{v:.2f}"} for k, v in detected_faces.items()]
+#     print("Detected faces:", formatted_faces)
+    
+#     return detected_faces
+
+# # Test the function with a specific image
+# test_image_path = "test_folder/Brad_pitt.jpg"
+# results = detect_and_classify_faces(test_image_path, model, class_names)
+# ======================================================
 # def detect_and_classify_faces(image_path, model, class_names):
 #     if not os.path.exists(image_path):
 #         raise FileNotFoundError(f"Image '{image_path}' not found.")
